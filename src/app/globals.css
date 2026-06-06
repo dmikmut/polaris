@@ -1,26 +1,249 @@
 @import "tailwindcss";
 
+/* Polaris — black void minimalism
+   Satoshi font is loaded via <link> in src/app/layout.tsx */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #000000;
+  --background-elevated: #060709;
+  --foreground: #e9ecf2;
+  --muted: #8c93a3;
+  --muted-foreground: #a8aebc;
+  --border: rgba(255, 255, 255, 0.05);
+  --border-strong: rgba(255, 255, 255, 0.09);
+  --primary: #7aa7e8;        /* icy stellar blue */
+  --primary-strong: #a8c6f5;
+  --accent: #9b8de3;          /* muted nebula violet */
+  --success: #4ec9a7;
+  --warning: #e5b067;
+  --error: #e07b7b;
+  --grid: rgba(255, 255, 255, 0.025);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+  --color-accent: var(--accent);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-error: var(--error);
+  --font-sans: var(--font-sans), "Satoshi", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-display: "Satoshi", var(--font-display), -apple-system, sans-serif;
+  --font-mono: var(--font-mono), "SF Mono", Monaco, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  border-color: var(--border);
 }
 
+html,
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.005em;
+  font-feature-settings: "cv11", "ss01", "ss03";
+}
+
+html,
+body {
+  font-family: "Satoshi", var(--font-sans), -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+body {
+  /* near-pure black void */
+  background: #000000;
+  min-height: 100vh;
+}
+
+/* Display headings — Space Grotesk */
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+/* Minimal glass — barely-there */
+.glass {
+  background: rgba(255, 255, 255, 0.018);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.glass-strong {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+}
+
+/* Faint starfield grid (rarely used) */
+.grid-bg {
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 72px 72px;
+}
+
+.grid-bg-fine {
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* Starlight text */
+.text-starlight {
+  background: linear-gradient(180deg, #ffffff 0%, #c9d3e6 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Aurora — used very sparingly on display headlines */
+.text-aurora {
+  background: linear-gradient(120deg, #cfd9ee 0%, #7aa7e8 45%, #9b8de3 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.1);
+  background-clip: padding-box;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+@keyframes twinkle {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+
+@keyframes drift {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+}
+
+@keyframes orbit-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes shine {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes aurora-drift {
+  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); }
+  33% { transform: translate(40px, -30px) rotate(120deg) scale(1.1); }
+  66% { transform: translate(-30px, 30px) rotate(240deg) scale(0.95); }
+}
+
+@keyframes marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+@keyframes draw-line {
+  0% { stroke-dashoffset: 1000; }
+  100% { stroke-dashoffset: 0; }
+}
+
+@keyframes fade-up {
+  0% { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 2.2s ease-in-out infinite;
+}
+
+.animate-twinkle {
+  animation: twinkle 3.6s ease-in-out infinite;
+}
+
+.animate-drift {
+  animation: drift 7s ease-in-out infinite;
+}
+
+.animate-aurora {
+  animation: aurora-drift 24s ease-in-out infinite;
+}
+
+.animate-marquee {
+  animation: marquee 40s linear infinite;
+}
+
+.shiny-text {
+  background: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0.65) 30%,
+    #ffffff 50%,
+    rgba(255, 255, 255, 0.65) 70%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shine 6s linear infinite;
+}
+
+.shiny-text-blue {
+  background: linear-gradient(
+    100deg,
+    rgba(168, 198, 245, 0.55) 30%,
+    #ffffff 50%,
+    rgba(168, 198, 245, 0.55) 70%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shine 5s linear infinite;
+}
+
+:focus-visible {
+  outline: 1.5px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: rgba(122, 167, 232, 0.22);
+  color: #fff;
+}
+
+.font-mono {
+  font-family: var(--font-mono), "SF Mono", Monaco, monospace;
+}
+
+/* Subtle hairline rule */
+.hairline {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--border-strong), transparent);
 }
