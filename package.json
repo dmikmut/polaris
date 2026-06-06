@@ -1,0 +1,26 @@
+{
+  "name": "polaris",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Multi-agent orchestration app with Planner, Executor, and Memory Claude agents powered by the Anthropic API",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "bin": {
+    "polaris": "./packages/cli/dist/index.js"
+  },
+  "scripts": {
+    "build": "npm run build -w @polaris/core && npm run build -w @polaris/server && npm run build -w @polaris/cli && npm run build -w @polaris/web",
+    "dev": "npm run dev -w @polaris/server",
+    "start": "node packages/cli/dist/index.js start",
+    "stop": "node packages/cli/dist/index.js stop",
+    "plan": "node packages/cli/dist/index.js plan",
+    "memory": "node packages/cli/dist/index.js memory",
+    "test": "npm run test -w @polaris/core"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
