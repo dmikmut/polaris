@@ -11,7 +11,8 @@
     "polaris": "./packages/cli/dist/index.js"
   },
   "scripts": {
-    "build": "npm run build -w @polaris/core && npm run build -w @polaris/server && npm run build -w @polaris/cli && npm run build -w @polaris/web",
+    "build": "npm run build -w @polaris/core && npm run build -w @polaris/server && npm run build -w @polaris/cli && npm run build:frontend",
+    "build:frontend": "cd ../../polaris-frontend && npm run build:static",
     "dev": "npm run dev -w @polaris/server",
     "start": "node packages/cli/dist/index.js start",
     "stop": "node packages/cli/dist/index.js stop",

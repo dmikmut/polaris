@@ -4,7 +4,7 @@ import { AGENT_NAMES, type AgentName } from "../lib/thinkingAgents";
 const AGENT_COLORS: Record<AgentName, string> = {
   planner: "var(--planner)",
   executor: "var(--executor)",
-  memory: "var(--memory)",
+  memory: "var(--reviewer)",
 };
 
 interface AgentThinkingStripProps {

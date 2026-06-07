@@ -1,5 +1,12 @@
 import { RateLimitError } from "@anthropic-ai/sdk";
 
+export const DEFAULT_RATE_LIMIT_RETRY_SECONDS = 60;
+
+export interface RateLimitDetails {
+  retryAfterSeconds: number;
+  formatted: string;
+}
+
 export function isRateLimitError(err: unknown): boolean {
   if (err instanceof RateLimitError) return true;
   if (err instanceof Error) {
@@ -27,9 +34,32 @@ function parseRetryAfterSeconds(headers: unknown): number | null {
   return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
 }
 
-export function formatRateLimitError(err: unknown): string {
+export function parseRetryAfterFromMessage(message: string): number | null {
+  const match = message.match(/\*\*Suggested wait:\*\*\s*about\s+(\d+)\s+second/i);
+  if (!match) return null;
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+export function getRateLimitDetails(err: unknown): RateLimitDetails {
+  const retryAfter =
+    err instanceof RateLimitError
+      ? (parseRetryAfterSeconds(err.headers) ?? DEFAULT_RATE_LIMIT_RETRY_SECONDS)
+      : DEFAULT_RATE_LIMIT_RETRY_SECONDS;
+
+  return {
+    retryAfterSeconds: retryAfter,
+    formatted: formatRateLimitError(err, retryAfter),
+  };
+}
+
+export function formatRateLimitError(
+  err: unknown,
+  retryAfterSeconds = DEFAULT_RATE_LIMIT_RETRY_SECONDS,
+): string {
   if (err instanceof RateLimitError) {
-    const retryAfter = parseRetryAfterSeconds(err.headers);
+    const resolvedRetryAfter =
+      parseRetryAfterSeconds(err.headers) ?? retryAfterSeconds;
     const apiMessage =
       typeof err.error === "object" &&
       err.error !== null &&
@@ -48,19 +78,15 @@ export function formatRateLimitError(err: unknown): string {
       lines.push("", `**Details:** ${apiMessage}`);
     }
 
-    if (retryAfter) {
-      const mins = Math.ceil(retryAfter / 60);
-      lines.push(
-        "",
-        `**Suggested wait:** about ${retryAfter} second${retryAfter === 1 ? "" : "s"}${mins > 1 ? ` (~${mins} min)` : ""} before retrying.`,
-      );
-    } else {
-      lines.push("", "**Suggested wait:** 1–2 minutes on free tier, then send a message to retry.");
-    }
+    const mins = Math.ceil(resolvedRetryAfter / 60);
+    lines.push(
+      "",
+      `**Suggested wait:** about ${resolvedRetryAfter} second${resolvedRetryAfter === 1 ? "" : "s"}${mins > 1 ? ` (~${mins} min)` : ""} before retrying.`,
+    );
 
     lines.push(
       "",
-      "When ready, type a note below (optional) and press **Send** to re-prompt the agent.",
+      "Use the **Retry** button when the countdown reaches zero. You can add an optional note below.",
     );
 
     return lines.join("\n");
@@ -72,9 +98,17 @@ export function formatRateLimitError(err: unknown): string {
       "",
       err.message.replace(/^429\s*/, ""),
       "",
-      "Wait a minute, then send a message to retry.",
+      `**Suggested wait:** about ${retryAfterSeconds} seconds before retrying.`,
+      "",
+      "Use the **Retry** button when the countdown reaches zero.",
     ].join("\n");
   }
 
-  return "**Anthropic API rate limit reached.** Wait a minute, then send a message to retry.";
+  return [
+    "**Anthropic API rate limit reached.**",
+    "",
+    `**Suggested wait:** about ${retryAfterSeconds} seconds before retrying.`,
+    "",
+    "Use the **Retry** button when the countdown reaches zero.",
+  ].join("\n");
 }

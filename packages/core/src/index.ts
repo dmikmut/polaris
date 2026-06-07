@@ -15,9 +15,20 @@ export {
   parseKnowledge,
   parsePlanTasks,
   parseResolutionStatus,
+  isPlanReadyForAccept,
 } from "./agent-manager.js";
 export type { AgentRunResult, StreamCallback } from "./agent-manager.js";
 export { MemoryStore } from "./memory-store.js";
+export {
+  loadProjectRegistry,
+  listAllProjectSummaries,
+  migrateRegistryFromWorkspace,
+  registerProject,
+  removeRegistryProject,
+  resolveRegistryProject,
+  setRegistryActiveProject,
+  updateRegistryProjectWorkspace,
+} from "./project-registry.js";
 export { formatRateLimitError, isRateLimitError } from "./rate-limit.js";
 export { Orchestrator } from "./orchestrator.js";
 export type {
@@ -31,10 +42,12 @@ export type {
   PlanRevision,
   PlanTask,
   ProjectPlan,
+  ProjectSummary,
   RateLimitResumeAction,
   RateLimitResumeContext,
   StoredError,
   StreamEvent,
+  MessageChannel,
   WorkflowPhase,
   WorkflowState,
 } from "./types.js";

@@ -10,12 +10,20 @@ import type {
   MemoryState,
   PlanRevision,
   ProjectPlan,
+  ProjectSummary,
   StoredError,
   WorkflowState,
 } from "./types.js";
 
 const MEMORY_DIR = ".polaris/memory";
 const ACTIVE_PROJECT_FILE = ".polaris/active-project.json";
+
+const RUNNING_PHASES: WorkflowState["phase"][] = [
+  "executing",
+  "error_resolution",
+  "human_intervention",
+  "rate_limit_pause",
+];
 
 export class MemoryStore {
   private readonly cwd: string;
@@ -30,13 +38,259 @@ export class MemoryStore {
     this.state = this.emptyState();
   }
 
+  static async clearWorkspaceMemory(cwd: string): Promise<void> {
+    const polarisDir = path.join(cwd, ".polaris");
+    const memoryDir = path.join(polarisDir, "memory");
+    await fs.rm(memoryDir, { recursive: true, force: true });
+    await fs.rm(path.join(polarisDir, ACTIVE_PROJECT_FILE), { force: true });
+  }
+
+  static async listProjectIds(cwd: string): Promise<string[]> {
+    const dir = path.join(cwd, MEMORY_DIR);
+    try {
+      const files = await fs.readdir(dir);
+      return files
+        .map((f) => f.match(/^([0-9a-f-]{36})\.json$/)?.[1])
+        .filter((id): id is string => Boolean(id));
+    } catch {
+      return [];
+    }
+  }
+
+  static async setActiveProject(cwd: string, projectId: string): Promise<void> {
+    await fs.mkdir(path.join(cwd, ".polaris"), { recursive: true });
+    await fs.writeFile(
+      path.join(cwd, ACTIVE_PROJECT_FILE),
+      JSON.stringify({ projectId, updatedAt: new Date().toISOString() }, null, 2),
+    );
+  }
+
+  static async createProject(cwd: string): Promise<string> {
+    const projectId = randomUUID();
+    const store = new MemoryStore(cwd, projectId);
+    await store.init();
+    await MemoryStore.setActiveProject(cwd, projectId);
+    return projectId;
+  }
+
+  static async migrateProjectFiles(
+    fromCwd: string,
+    toCwd: string,
+    projectId: string,
+  ): Promise<void> {
+    const fromDir = path.join(fromCwd, MEMORY_DIR);
+    const toDir = path.join(toCwd, MEMORY_DIR);
+    await fs.mkdir(toDir, { recursive: true });
+
+    for (const suffix of [
+      "",
+      "-workflow",
+      "-plan",
+      "-sessions",
+      "-connections",
+      "-errors",
+      "-knowledge",
+    ]) {
+      const src = path.join(fromDir, `${projectId}${suffix}.json`);
+      const dest = path.join(toDir, `${projectId}${suffix}.json`);
+      try {
+        await fs.copyFile(src, dest);
+        await fs.rm(src, { force: true });
+      } catch {
+        /* file may not exist */
+      }
+    }
+
+    const fromActive = path.join(fromCwd, ACTIVE_PROJECT_FILE);
+    try {
+      const raw = await fs.readFile(fromActive, "utf-8");
+      const { projectId: activeId } = JSON.parse(raw) as { projectId: string };
+      if (activeId === projectId) {
+        await fs.rm(fromActive, { force: true });
+      }
+    } catch {
+      /* no active file */
+    }
+
+    await MemoryStore.setActiveProject(toCwd, projectId);
+  }
+
+  static async deleteProject(cwd: string, projectId: string): Promise<void> {
+    const dir = path.join(cwd, MEMORY_DIR);
+    for (const suffix of [
+      "",
+      "-workflow",
+      "-plan",
+      "-sessions",
+      "-connections",
+      "-errors",
+      "-knowledge",
+    ]) {
+      await fs.rm(path.join(dir, `${projectId}${suffix}.json`), { force: true });
+    }
+    const activeId = await MemoryStore.resolveProjectId(cwd);
+    if (activeId === projectId) {
+      await fs.rm(path.join(cwd, ACTIVE_PROJECT_FILE), { force: true });
+    }
+  }
+
+  static isRunningPhase(phase: WorkflowState["phase"]): boolean {
+    return RUNNING_PHASES.includes(phase);
+  }
+
+  static async findRunningProjectId(cwd: string): Promise<string | null> {
+    const summaries = await MemoryStore.listProjectSummaries(cwd);
+    return summaries.find((p) => p.isRunning)?.id ?? null;
+  }
+
+  static async loadProjectSummary(
+    cwd: string,
+    projectId: string,
+    activeId?: string,
+  ): Promise<ProjectSummary> {
+    const active = activeId ?? (await MemoryStore.resolveProjectId(cwd));
+    const statePath = path.join(cwd, MEMORY_DIR, `${projectId}.json`);
+    const workflowPath = path.join(cwd, MEMORY_DIR, `${projectId}-workflow.json`);
+
+    let state = MemoryStore.emptyStateFor(projectId);
+    let workflow: WorkflowState | null = null;
+
+    try {
+      const raw = await fs.readFile(statePath, "utf-8");
+      state = { ...JSON.parse(raw) as MemoryState, agentSessions: {} };
+    } catch {
+      /* new or missing */
+    }
+    try {
+      workflow = JSON.parse(await fs.readFile(workflowPath, "utf-8")) as WorkflowState;
+    } catch {
+      /* no workflow yet */
+    }
+
+    const phase = workflow?.phase ?? "planning";
+    const plan = state.plan;
+    const firstHuman = workflow?.messages?.find((m) => m.agent === "human");
+    const goal =
+      state.name ??
+      plan?.goal ??
+      (firstHuman ? firstHuman.content.slice(0, 80) : "New project");
+
+    return {
+      id: projectId,
+      goal,
+      phase,
+      planAccepted: plan?.accepted ?? false,
+      completedTasks: plan?.tasks.filter((t) => t.status === "completed").length ?? 0,
+      totalTasks: plan?.tasks.length ?? 0,
+      updatedAt: state.updatedAt || workflow?.messages?.at(-1)?.timestamp || new Date().toISOString(),
+      isActive: active === projectId,
+      isRunning: MemoryStore.isRunningPhase(phase) && (plan?.accepted ?? false),
+    };
+  }
+
+  static async renameProject(cwd: string, projectId: string, name: string): Promise<void> {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new Error("Project name cannot be empty");
+    }
+
+    const statePath = path.join(cwd, MEMORY_DIR, `${projectId}.json`);
+    let state: MemoryState;
+    try {
+      state = JSON.parse(await fs.readFile(statePath, "utf-8")) as MemoryState;
+    } catch {
+      state = MemoryStore.emptyStateFor(projectId);
+    }
+
+    state.name = trimmed;
+    if (state.plan) {
+      state.plan = { ...state.plan, goal: trimmed, updatedAt: new Date().toISOString() };
+    }
+    state.updatedAt = new Date().toISOString();
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2));
+
+    if (state.plan) {
+      await fs.writeFile(
+        path.join(cwd, MEMORY_DIR, `${projectId}-plan.json`),
+        JSON.stringify(state.plan, null, 2),
+      );
+    }
+  }
+
+  private static emptyStateFor(projectId: string): MemoryState {
+    return {
+      projectId,
+      name: undefined,
+      plan: null,
+      connections: [],
+      errors: [],
+      knowledge: [],
+      agentSessions: {},
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  static async listProjectSummaries(cwd: string): Promise<ProjectSummary[]> {
+    const ids = await MemoryStore.listProjectIds(cwd);
+    const activeId = await MemoryStore.resolveProjectId(cwd);
+    const summaries = await Promise.all(
+      ids.map((id) => MemoryStore.loadProjectSummary(cwd, id, activeId ?? undefined)),
+    );
+    return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  static async stopProjectOnDisk(cwd: string, projectId: string): Promise<void> {
+    const workflowPath = path.join(cwd, MEMORY_DIR, `${projectId}-workflow.json`);
+    const statePath = path.join(cwd, MEMORY_DIR, `${projectId}.json`);
+
+    let workflow: WorkflowState | null = null;
+    let state: MemoryState | null = null;
+
+    try {
+      workflow = JSON.parse(await fs.readFile(workflowPath, "utf-8")) as WorkflowState;
+    } catch {
+      return;
+    }
+    try {
+      state = JSON.parse(await fs.readFile(statePath, "utf-8")) as MemoryState;
+    } catch {
+      /* continue */
+    }
+
+    workflow.phase = "planning";
+    workflow.currentTaskId = null;
+    workflow.humanInterventionActive = false;
+    workflow.memoryAgentActive = false;
+    workflow.memoryCaptureActive = false;
+    workflow.pendingExecutorNotes = [];
+    workflow.pendingPlanRevisions = [];
+    workflow.pauseForHumanUpdate = false;
+    workflow.rateLimitMessage = null;
+    workflow.rateLimitPausedAgent = null;
+    workflow.rateLimitRetryAt = null;
+    workflow.rateLimitResume = null;
+
+    await fs.writeFile(workflowPath, JSON.stringify(workflow, null, 2));
+
+    if (state?.plan) {
+      state.plan.accepted = false;
+      delete state.plan.acceptedAt;
+      state.plan.tasks = state.plan.tasks.map((task) =>
+        task.status === "in_progress" ? { ...task, status: "pending" as const } : task,
+      );
+      state.updatedAt = new Date().toISOString();
+      await fs.writeFile(statePath, JSON.stringify(state, null, 2));
+      const planPath = path.join(cwd, MEMORY_DIR, `${projectId}-plan.json`);
+      await fs.writeFile(planPath, JSON.stringify(state.plan, null, 2));
+    }
+  }
+
   static async resolveProjectId(cwd: string): Promise<string | undefined> {
     const activePath = path.join(cwd, ACTIVE_PROJECT_FILE);
     try {
       const raw = await fs.readFile(activePath, "utf-8");
       const { projectId } = JSON.parse(raw) as { projectId: string };
-      const statePath = path.join(cwd, MEMORY_DIR, `${projectId}.json`);
-      await fs.access(statePath);
+      if (!projectId) return undefined;
       return projectId;
     } catch {
       return undefined;
@@ -50,9 +304,16 @@ export class MemoryStore {
     return store;
   }
 
+  static async open(cwd: string, projectId: string): Promise<MemoryStore> {
+    const store = new MemoryStore(cwd, projectId);
+    await store.init();
+    return store;
+  }
+
   private emptyState(): MemoryState {
     return {
       projectId: this.projectId,
+      name: undefined,
       plan: null,
       connections: [],
       errors: [],
@@ -91,7 +352,13 @@ export class MemoryStore {
     return path.join(this.baseDir, `${this.projectId}-workflow.json`);
   }
 
+  private async ensureBaseDir(): Promise<void> {
+    await fs.mkdir(this.baseDir, { recursive: true });
+    await fs.mkdir(path.join(this.cwd, ".polaris"), { recursive: true });
+  }
+
   async saveWorkflow(workflow: WorkflowState): Promise<void> {
+    await this.ensureBaseDir();
     await fs.writeFile(this.workflowPath(), JSON.stringify(workflow, null, 2));
   }
 
@@ -129,6 +396,7 @@ export class MemoryStore {
   }
 
   async persist(): Promise<void> {
+    await this.ensureBaseDir();
     this.state.updatedAt = new Date().toISOString();
     await fs.writeFile(this.statePath(), JSON.stringify(this.state, null, 2));
 
@@ -167,10 +435,27 @@ export class MemoryStore {
     await this.persist();
   }
 
+  async rename(name: string): Promise<void> {
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Project name cannot be empty");
+    this.state.name = trimmed;
+    if (this.state.plan) {
+      this.state.plan = { ...this.state.plan, goal: trimmed, updatedAt: new Date().toISOString() };
+    }
+    await this.persist();
+  }
+
   async acceptPlan(): Promise<void> {
     if (!this.state.plan) return;
     this.state.plan.accepted = true;
     this.state.plan.acceptedAt = new Date().toISOString();
+    await this.persist();
+  }
+
+  async unacceptPlan(): Promise<void> {
+    if (!this.state.plan) return;
+    this.state.plan.accepted = false;
+    delete this.state.plan.acceptedAt;
     await this.persist();
   }
 

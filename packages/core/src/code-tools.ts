@@ -1,10 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn, type ChildProcess } from "node:child_process";
 import type Anthropic from "@anthropic-ai/sdk";
 
-const execAsync = promisify(exec);
+export type ToolRunOptions = {
+  shouldAbort?: () => boolean;
+  registerProcess?: (child: ChildProcess) => void;
+};
 
 const MAX_FILE_BYTES = 512_000;
 const MAX_OUTPUT_BYTES = 64_000;
@@ -65,11 +67,79 @@ export const EXECUTOR_TOOLS: Anthropic.Tool[] = [
   },
 ];
 
+async function runShellCommand(
+  cwd: string,
+  command: string,
+  options?: ToolRunOptions,
+): Promise<string> {
+  if (options?.shouldAbort?.()) {
+    return "Error: Stopped.";
+  }
+
+  return new Promise((resolve) => {
+    const child = spawn(command, {
+      cwd,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    options?.registerProcess?.(child);
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    const finish = (value: string) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      if (stdout.length > MAX_OUTPUT_BYTES) {
+        stdout = stdout.slice(0, MAX_OUTPUT_BYTES);
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+      if (stderr.length > MAX_OUTPUT_BYTES) {
+        stderr = stderr.slice(0, MAX_OUTPUT_BYTES);
+      }
+    });
+
+    child.on("error", (err) => finish(`Error: ${err.message}`));
+    child.on("close", () => {
+      if (options?.shouldAbort?.()) {
+        finish("Error: Stopped.");
+        return;
+      }
+      const out = [stdout, stderr].filter(Boolean).join("\n");
+      finish(out || "(no output)");
+    });
+
+    const timeout = setTimeout(() => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+      finish("Error: command timed out after 120s");
+    }, 120_000);
+
+    child.on("exit", () => clearTimeout(timeout));
+  });
+}
+
 export async function executeTool(
   cwd: string,
   name: string,
   input: Record<string, unknown>,
+  options?: ToolRunOptions,
 ): Promise<string> {
+  if (options?.shouldAbort?.()) {
+    return "Error: Stopped.";
+  }
+
   try {
     switch (name) {
       case "read_file": {
@@ -94,13 +164,7 @@ export async function executeTool(
           .join("\n");
       }
       case "run_command": {
-        const { stdout, stderr } = await execAsync(String(input.command), {
-          cwd,
-          timeout: 120_000,
-          maxBuffer: MAX_OUTPUT_BYTES,
-        });
-        const out = [stdout, stderr].filter(Boolean).join("\n");
-        return out || "(no output)";
+        return runShellCommand(cwd, String(input.command), options);
       }
       default:
         return `Error: unknown tool ${name}`;

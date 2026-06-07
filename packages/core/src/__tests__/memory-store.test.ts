@@ -101,13 +101,61 @@ describe("MemoryStore", () => {
       memoryCaptureActive: false,
       rateLimitMessage: null,
       rateLimitPausedAgent: null,
+      rateLimitRetryAt: null,
       rateLimitResume: null,
       pendingExecutorNotes: [],
       pendingPlanRevisions: [],
+      pauseForHumanUpdate: false,
     };
 
     await store.saveWorkflow(workflow);
     const loaded = await store.loadWorkflow();
     assert.equal(loaded?.phase, "executing");
+  });
+
+  it("saveWorkflow recreates memory directory if missing", async () => {
+    const store = new MemoryStore(tmpDir);
+    await store.init();
+
+    const workflow = {
+      projectId: store.getProjectId(),
+      phase: "planning" as const,
+      cwd: tmpDir,
+      messages: [],
+      currentTaskId: null,
+      errorResolutionStartedAt: null,
+      errorResolutionAttempts: 0,
+      humanInterventionActive: false,
+      memoryAgentActive: false,
+      memoryCaptureActive: false,
+      rateLimitMessage: null,
+      rateLimitPausedAgent: null,
+      rateLimitRetryAt: null,
+      rateLimitResume: null,
+      pendingExecutorNotes: [],
+      pendingPlanRevisions: [],
+      pauseForHumanUpdate: false,
+    };
+
+    await fs.rm(path.join(tmpDir, ".polaris", "memory"), { recursive: true, force: true });
+    await store.saveWorkflow(workflow);
+
+    const loaded = await store.loadWorkflow();
+    assert.equal(loaded?.phase, "planning");
+  });
+
+  it("resolveProjectId returns active project before state file exists", async () => {
+    const projectId = "9f290d7a-3622-474d-a13a-dd3b22c6abb7";
+    await fs.mkdir(path.join(tmpDir, ".polaris"), { recursive: true });
+    await fs.writeFile(
+      path.join(tmpDir, ".polaris", "active-project.json"),
+      JSON.stringify({ projectId, updatedAt: new Date().toISOString() }),
+    );
+
+    const resolved = await MemoryStore.resolveProjectId(tmpDir);
+    assert.equal(resolved, projectId);
+
+    const store = await MemoryStore.open(tmpDir, projectId);
+    assert.equal(store.getProjectId(), projectId);
   });
 });

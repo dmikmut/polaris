@@ -46,6 +46,7 @@ export interface ProjectPlan {
   tasks: PlanTask[];
   accepted: boolean;
   acceptedAt?: string;
+  readyForAccept?: boolean;
   revisions: PlanRevision[];
   createdAt: string;
   updatedAt: string;
@@ -87,6 +88,7 @@ export interface AgentSessionState {
 
 export interface MemoryState {
   projectId: string;
+  name?: string;
   plan: ProjectPlan | null;
   connections: Connection[];
   errors: StoredError[];
@@ -126,9 +128,26 @@ export interface WorkflowState {
   memoryCaptureActive: boolean;
   rateLimitMessage: string | null;
   rateLimitPausedAgent: AgentRole | null;
+  rateLimitRetryAt: string | null;
   rateLimitResume: RateLimitResumeContext | null;
   pendingExecutorNotes: string[];
   pendingPlanRevisions: string[];
+  pauseForHumanUpdate: boolean;
+}
+
+export type MessageChannel = "planner" | "execution" | "reviewer" | "discourse";
+
+export interface ProjectSummary {
+  id: string;
+  goal: string;
+  phase: WorkflowPhase;
+  planAccepted: boolean;
+  completedTasks: number;
+  totalTasks: number;
+  updatedAt: string;
+  isActive: boolean;
+  isRunning: boolean;
+  workspacePath?: string;
 }
 
 export interface OrchestratorConfig {
@@ -138,6 +157,7 @@ export interface OrchestratorConfig {
   errorTimeoutMs?: number;
   maxErrorRetries?: number;
   memoryDir?: string;
+  projectId?: string;
 }
 
 export interface StreamEvent {

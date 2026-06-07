@@ -21,7 +21,12 @@ Format tasks as JSON in a fenced code block tagged "plan-tasks":
 [{"title": "...", "description": "..."}]
 \`\`\`
 
-Be collaborative. Ask clarifying questions. Do not execute code — only plan.`;
+Be collaborative. Ask clarifying questions until the goal and scope are clear. Do not execute code — only plan.
+
+Plan readiness:
+- While you still need clarification or the task list is incomplete, end your response with: PLAN_STATUS: drafting
+- When the user has answered your questions and you output a complete plan-tasks block, end with: PLAN_STATUS: ready
+- Never output PLAN_STATUS: ready without a complete plan-tasks JSON block.`;
 
 const EXECUTOR_SYSTEM = `You are the Executor Agent (Claude Code) in Polaris, a multi-agent development system.
 
@@ -69,6 +74,7 @@ export interface AgentRunResult {
   text: string;
   status: "finished" | "error" | "rate_limit" | "cancelled";
   runId: string;
+  rateLimitRetryAfterSeconds?: number;
 }
 
 export type StreamCallback = (chunk: string) => void;
@@ -114,25 +120,38 @@ export class AgentManager {
     role: AgentRole,
     prompt: string,
     onStream?: StreamCallback,
+    options?: { shouldAbort?: () => boolean },
   ): Promise<AgentRunResult> {
     const result = await this.pool.run(
       role,
       this.systemPrompt(role),
       prompt,
       onStream,
-      { useTools: role === "executor" },
+      {
+        useTools: role === "executor",
+        shouldAbort: options?.shouldAbort,
+      },
     );
 
     return {
       text: result.text,
       status: result.status,
       runId: result.runId,
+      rateLimitRetryAfterSeconds: result.rateLimitRetryAfterSeconds,
     };
   }
 
-  async dispose(): Promise<void> {
-    // No persistent connections to close
+  abortAll(): void {
+    this.pool.abortAll();
   }
+
+  async dispose(): Promise<void> {
+    this.pool.abortAll();
+  }
+}
+
+export function isPlanReadyForAccept(text: string): boolean {
+  return /PLAN_STATUS:\s*ready\b/i.test(text);
 }
 
 export function parsePlanTasks(text: string): { title: string; description: string }[] {

@@ -1,6 +1,12 @@
 export const AGENT_NAMES = ["planner", "executor", "memory"] as const;
 export type AgentName = (typeof AGENT_NAMES)[number];
 
+export const AGENT_DISPLAY_NAMES: Record<AgentName, string> = {
+  planner: "Planner",
+  executor: "Executor",
+  memory: "Reviewer",
+};
+
 export function getThinkingAgents(options: {
   agentBusy: boolean;
   workingAgent: string | null;

@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { AgentManager, parsePlanTasks } from "./agent-manager.js";
+import { AgentManager, isPlanReadyForAccept, parsePlanTasks } from "./agent-manager.js";
+import {
+  DEFAULT_RATE_LIMIT_RETRY_SECONDS,
+  parseRetryAfterFromMessage,
+} from "./rate-limit.js";
 import type { AgentRunResult } from "./agent-manager.js";
 import { MemoryStore } from "./memory-store.js";
 import type {
@@ -24,6 +28,8 @@ export class Orchestrator {
   private listeners: EventListener[] = [];
   private currentErrorId: string | null = null;
   private executorChainActive = false;
+  private haltRequested = false;
+  private operationChain: Promise<unknown> = Promise.resolve();
 
   private constructor(config: OrchestratorConfig, memory: MemoryStore) {
     this.config = {
@@ -44,14 +50,18 @@ export class Orchestrator {
       memoryCaptureActive: false,
       rateLimitMessage: null,
       rateLimitPausedAgent: null,
+      rateLimitRetryAt: null,
       rateLimitResume: null,
       pendingExecutorNotes: [],
       pendingPlanRevisions: [],
+      pauseForHumanUpdate: false,
     };
   }
 
   static async create(config: OrchestratorConfig): Promise<Orchestrator> {
-    const memory = await MemoryStore.create(config.cwd);
+    const memory = config.projectId
+      ? await MemoryStore.open(config.cwd, config.projectId)
+      : await MemoryStore.create(config.cwd);
     return new Orchestrator(config, memory);
   }
 
@@ -60,6 +70,15 @@ export class Orchestrator {
     return () => {
       this.listeners = this.listeners.filter((l) => l !== listener);
     };
+  }
+
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.operationChain.then(fn, fn);
+    this.operationChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   private emit(type: StreamEvent["type"], payload: unknown): void {
@@ -103,7 +122,30 @@ export class Orchestrator {
     void this.persistWorkflow();
   }
 
+  haltAgents(): void {
+    this.haltRequested = true;
+    this.executorChainActive = false;
+    this.workflow.memoryCaptureActive = false;
+    this.workflow.memoryAgentActive = false;
+    this.workflow.pauseForHumanUpdate = false;
+    this.agents.abortAll();
+
+    for (const role of ["planner", "executor", "memory"] as const) {
+      this.emit("agent_working", { agent: role, working: false });
+    }
+    this.emit("agent_status", {
+      memoryAgentActive: false,
+      memoryCaptureActive: false,
+      pauseForHumanUpdate: false,
+    });
+  }
+
+  private resumeAgents(): void {
+    this.haltRequested = false;
+  }
+
   async init(): Promise<void> {
+    this.resumeAgents();
     this.workflow.projectId = this.memory.getProjectId();
 
     const saved = await this.memory.loadWorkflow();
@@ -117,22 +159,60 @@ export class Orchestrator {
         errorResolutionAttempts: saved.errorResolutionAttempts ?? 0,
         rateLimitMessage: saved.rateLimitMessage ?? null,
         rateLimitPausedAgent: saved.rateLimitPausedAgent ?? null,
+        rateLimitRetryAt: saved.rateLimitRetryAt ?? null,
         rateLimitResume: saved.rateLimitResume ?? null,
         pendingExecutorNotes: saved.pendingExecutorNotes ?? [],
         pendingPlanRevisions: saved.pendingPlanRevisions ?? [],
+        pauseForHumanUpdate: saved.pauseForHumanUpdate ?? false,
       };
       this.emit("phase_change", { phase: this.workflow.phase });
+      if (
+        this.workflow.phase === "rate_limit_pause" &&
+        !this.workflow.rateLimitRetryAt &&
+        this.workflow.rateLimitMessage
+      ) {
+        const retryAfterSeconds =
+          parseRetryAfterFromMessage(this.workflow.rateLimitMessage) ??
+          DEFAULT_RATE_LIMIT_RETRY_SECONDS;
+        this.workflow.rateLimitRetryAt = new Date(
+          Date.now() + retryAfterSeconds * 1000,
+        ).toISOString();
+      }
     } else {
       this.setPhase("planning");
     }
 
     this.agents.initializeAgents(this.memory.getAgentSessions());
+    this.syncWorkflowWithPlan();
     this.emit("memory_update", this.memory.getState());
     await this.persistWorkflow();
 
-    if (this.workflow.phase === "executing" && !this.workflow.humanInterventionActive) {
+    const plan = this.memory.getState().plan;
+    if (
+      this.workflow.phase === "executing" &&
+      plan?.accepted &&
+      !this.workflow.humanInterventionActive
+    ) {
       void this.executeNextTask();
     }
+  }
+
+  private syncWorkflowWithPlan(): void {
+    const plan = this.memory.getState().plan;
+    if (this.workflow.phase === "executing" && !plan?.accepted) {
+      this.workflow.phase = "planning";
+      this.emit("phase_change", { phase: "planning" });
+    }
+  }
+
+  private canExecute(): boolean {
+    const plan = this.memory.getState().plan;
+    return (
+      this.workflow.phase === "executing" &&
+      Boolean(plan?.accepted) &&
+      !this.workflow.humanInterventionActive &&
+      !this.haltRequested
+    );
   }
 
   private async persistAgentSessions(): Promise<void> {
@@ -148,11 +228,30 @@ export class Orchestrator {
   }
 
   private async runAgent(role: AgentRole, prompt: string): Promise<AgentRunResult> {
+    if (this.haltRequested) {
+      return { text: "Stopped.", status: "error", runId: "halted" };
+    }
+
     this.emit("agent_working", { agent: role, working: true });
     try {
-      return await this.agents.send(role, prompt, (chunk) =>
-        this.emit("stream_chunk", { agent: role, chunk }),
+      if (this.haltRequested) {
+        return { text: "Stopped.", status: "error", runId: "halted" };
+      }
+      const result = await this.agents.send(
+        role,
+        prompt,
+        (chunk) => {
+          if (!this.haltRequested) {
+            this.emit("stream_chunk", { agent: role, chunk });
+          }
+        },
+        { shouldAbort: () => this.haltRequested },
       );
+
+      if (this.haltRequested || result.status === "cancelled") {
+        return { text: "Stopped.", status: "error", runId: "halted" };
+      }
+      return result;
     } finally {
       this.emit("agent_working", { agent: role, working: false });
     }
@@ -162,15 +261,19 @@ export class Orchestrator {
     agent: AgentRole,
     formattedMessage: string,
     resume: Omit<RateLimitResumeContext, "agent">,
+    retryAfterSeconds = DEFAULT_RATE_LIMIT_RETRY_SECONDS,
   ): Promise<void> {
     this.executorChainActive = false;
+    const retryAt = new Date(Date.now() + retryAfterSeconds * 1000).toISOString();
     this.workflow.rateLimitMessage = formattedMessage;
     this.workflow.rateLimitPausedAgent = agent;
+    this.workflow.rateLimitRetryAt = retryAt;
     this.workflow.rateLimitResume = { agent, ...resume };
     this.setPhase("rate_limit_pause");
     this.emit("agent_status", {
       rateLimitMessage: formattedMessage,
       rateLimitPausedAgent: agent,
+      rateLimitRetryAt: retryAt,
       rateLimitResume: this.workflow.rateLimitResume,
     });
     this.addMessage("system", "human", formattedMessage);
@@ -183,7 +286,11 @@ export class Orchestrator {
     resume: Omit<RateLimitResumeContext, "agent">,
   ): Promise<AgentRunResult | null> {
     if (result.status !== "rate_limit") return result;
-    await this.pauseForRateLimit(agent, result.text, resume);
+    const retryAfterSeconds =
+      result.rateLimitRetryAfterSeconds ??
+      parseRetryAfterFromMessage(result.text) ??
+      DEFAULT_RATE_LIMIT_RETRY_SECONDS;
+    await this.pauseForRateLimit(agent, result.text, resume, retryAfterSeconds);
     return null;
   }
 
@@ -192,12 +299,18 @@ export class Orchestrator {
     result: AgentRunResult,
   ): Promise<void> {
     await this.persistAgentSessions();
-    this.addMessage("assistant", "planner", result.text);
+    const responseText =
+      result.status === "error" ? `Planner error: ${result.text}` : result.text;
+    this.addMessage("assistant", "planner", responseText, { channel: "planner" });
 
     const parsedTasks = parsePlanTasks(result.text);
+    const readyForAccept = isPlanReadyForAccept(result.text) && parsedTasks.length > 0;
     if (parsedTasks.length > 0) {
-      await this.updatePlanFromTasks(parsedTasks, userMessage, result.text);
+      await this.updatePlanFromTasks(parsedTasks, userMessage, result.text, readyForAccept);
     } else if (this.memory.getState().plan) {
+      const existing = this.memory.getState().plan!;
+      await this.memory.setPlan({ ...existing, readyForAccept: false });
+      this.emit("memory_update", this.memory.getState());
       await this.memory.addPlanRevision(userMessage, "user");
       await this.memory.addPlanRevision(result.text, "planner");
     }
@@ -224,37 +337,42 @@ export class Orchestrator {
   }
 
   async sendPlannerMessage(userMessage: string): Promise<void> {
-    if (this.workflow.phase === "rate_limit_pause") {
-      throw new Error("Resolve the rate limit pause before sending planner messages.");
-    }
-    if (this.workflow.phase === "completed") {
-      await this.beginNewPlanningCycle();
-    } else if (this.workflow.phase !== "planning" && this.workflow.phase !== "idle") {
-      throw new Error(
-        "Planner input is only allowed during planning, after completion, or via plan revision during execution.",
-      );
-    }
-    this.addMessage("user", "human", userMessage);
+    this.haltAgents();
+    return this.runExclusive(async () => {
+      this.resumeAgents();
+      if (this.workflow.phase === "rate_limit_pause") {
+        throw new Error("Resolve the rate limit pause before sending planner messages.");
+      }
+      if (this.workflow.phase === "completed") {
+        await this.beginNewPlanningCycle();
+      } else if (this.workflow.phase !== "planning" && this.workflow.phase !== "idle") {
+        throw new Error(
+          "Planner input is only allowed during planning, after completion, or via plan revision during execution.",
+        );
+      }
+      this.addMessage("user", "human", userMessage, { channel: "planner" });
 
-    const memoryContext = this.memory.buildContextPrompt();
-    const prompt = memoryContext
-      ? `${memoryContext}\n\n---\n\nUser message: ${userMessage}`
-      : userMessage;
+      const memoryContext = this.memory.buildContextPrompt();
+      const prompt = memoryContext
+        ? `${memoryContext}\n\n---\n\nUser message: ${userMessage}`
+        : userMessage;
 
-    const result = await this.runAgent("planner", prompt);
-    const checked = await this.handleRateLimitResult(result, "planner", {
-      previousPhase: this.workflow.phase,
-      action: { type: "planner", userMessage },
+      const result = await this.runAgent("planner", prompt);
+      const checked = await this.handleRateLimitResult(result, "planner", {
+        previousPhase: this.workflow.phase,
+        action: { type: "planner", userMessage },
+      });
+      if (!checked) return;
+
+      await this.finishPlannerRun(userMessage, checked);
     });
-    if (!checked) return;
-
-    await this.finishPlannerRun(userMessage, checked);
   }
 
   private async updatePlanFromTasks(
     tasks: { title: string; description: string }[],
     goal: string,
     summary: string,
+    readyForAccept = false,
   ): Promise<void> {
     const existing = this.memory.getState().plan;
     const planTasks: PlanTask[] = tasks.map((t, i) => ({
@@ -265,12 +383,21 @@ export class Orchestrator {
       order: i,
     }));
 
+    const briefSummary =
+      summary
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line && !line.startsWith("#") && !line.startsWith("```")) ??
+      existing?.summary ??
+      goal;
+
     const plan: ProjectPlan = {
       id: existing?.id ?? randomUUID(),
       goal: existing?.goal ?? goal,
-      summary,
+      summary: briefSummary.slice(0, 280),
       tasks: planTasks,
       accepted: false,
+      readyForAccept,
       revisions: existing?.revisions ?? [],
       createdAt: existing?.createdAt ?? new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -281,36 +408,83 @@ export class Orchestrator {
   }
 
   async acceptPlan(): Promise<void> {
-    const plan = this.memory.getState().plan;
-    if (!plan) {
-      throw new Error("No plan to accept. Discuss your goal with the Planner first.");
-    }
+    return this.runExclusive(async () => {
+      const plan = this.memory.getState().plan;
+      if (!plan) {
+        throw new Error("No plan to accept. Discuss your goal with the Planner first.");
+      }
+      if (!plan.tasks.length) {
+        throw new Error(
+          "The Planner has not produced a full task list yet. Continue the discussion before accepting.",
+        );
+      }
+      if (!plan.readyForAccept) {
+        throw new Error(
+          "The Planner has not marked the plan as ready. Answer any open questions before accepting.",
+        );
+      }
+      if (plan.accepted) {
+        throw new Error("Plan is already accepted.");
+      }
+      if (
+        this.workflow.phase !== "planning" &&
+        this.workflow.phase !== "idle" &&
+        this.workflow.phase !== "completed"
+      ) {
+        throw new Error("Plan can only be accepted during the planning phase.");
+      }
 
-    await this.memory.acceptPlan();
-    this.setPhase("executing");
-    this.emit("memory_update", this.memory.getState());
-    void this.executeNextTask();
+      const runningId = await MemoryStore.findRunningProjectId(this.config.cwd);
+      if (runningId && runningId !== this.memory.getProjectId()) {
+        throw new Error(
+          "Another project is still running. Stop it on the Projects page before accepting this plan.",
+        );
+      }
+
+      this.haltAgents();
+      this.resumeAgents();
+      await this.memory.acceptPlan();
+      this.setPhase("executing");
+      this.emit("memory_update", this.memory.getState());
+      void this.executeNextTask();
+    });
   }
 
   async revisePlanDuringExecution(
     revision: string,
     options?: { skipUserMessage?: boolean; skipResumeExecution?: boolean },
   ): Promise<void> {
+    if (!options?.skipUserMessage) {
+      this.haltAgents();
+      return this.runExclusive(async () => {
+        this.resumeAgents();
+        await this.revisePlanDuringExecution(revision, {
+          ...options,
+          skipUserMessage: true,
+        });
+      });
+    }
     if (this.workflow.phase !== "executing") {
       throw new Error("Plan revision is only allowed during execution.");
     }
 
+    if (!options?.skipResumeExecution) {
+      this.resumeAgents();
+    }
+
     if (!options?.skipUserMessage) {
-      this.addMessage("user", "human", revision);
+      this.addMessage("user", "human", revision, { channel: "planner" });
       await this.memory.addPlanRevision(revision, "user");
 
       if (this.executorChainActive) {
         this.workflow.pendingPlanRevisions.push(revision);
+        this.workflow.pauseForHumanUpdate = true;
         await this.persistWorkflow();
         this.addMessage(
           "system",
           "planner",
           "Plan revision queued — the Planner will apply it before the next task.",
+          { channel: "planner" },
         );
         return;
       }
@@ -328,7 +502,7 @@ export class Orchestrator {
 
     await this.persistAgentSessions();
 
-    this.addMessage("assistant", "planner", checked.text);
+    this.addMessage("assistant", "planner", checked.text, { channel: "planner" });
 
     const parsedTasks = parsePlanTasks(checked.text);
     if (parsedTasks.length > 0) {
@@ -365,19 +539,24 @@ export class Orchestrator {
   }
 
   async sendExecutorHumanUpdate(humanMessage: string): Promise<void> {
+    this.haltAgents();
+    return this.runExclusive(async () => {
+    this.resumeAgents();
     if (this.workflow.phase !== "executing") {
       throw new Error("Executor updates are only allowed during execution.");
     }
 
-    this.addMessage("user", "human", humanMessage);
+    this.addMessage("user", "human", humanMessage, { channel: "execution" });
     this.workflow.pendingExecutorNotes.push(humanMessage);
+    this.workflow.pauseForHumanUpdate = true;
     await this.persistWorkflow();
 
     if (this.executorChainActive) {
       this.addMessage(
         "system",
         "executor",
-        "Update queued — the Executor will apply it on the next step.",
+        "Your update takes priority — the Executor will apply it before continuing.",
+        { channel: "execution" },
       );
       return;
     }
@@ -388,19 +567,57 @@ export class Orchestrator {
       plan?.tasks.find((t) => t.status === "pending");
 
     if (!activeTask || !plan) {
-      this.addMessage("system", "executor", "Update saved. No pending tasks to apply it to.");
+      this.addMessage("system", "executor", "Update saved. No pending tasks to apply it to.", {
+        channel: "execution",
+      });
       this.workflow.pendingExecutorNotes = [];
       await this.persistWorkflow();
       return;
     }
 
     await this.runExecutorWithHumanUpdate(activeTask, plan, humanMessage);
+    });
+  }
+
+  private async applyPendingHumanExecutorUpdate(): Promise<boolean> {
+    if (!this.workflow.pendingExecutorNotes.length) {
+      this.workflow.pauseForHumanUpdate = false;
+      await this.persistWorkflow();
+      return false;
+    }
+
+    const plan = this.memory.getState().plan;
+    if (!plan) {
+      this.workflow.pauseForHumanUpdate = false;
+      await this.persistWorkflow();
+      return false;
+    }
+
+    const humanMessage =
+      this.workflow.pendingExecutorNotes[this.workflow.pendingExecutorNotes.length - 1];
+    const activeTask =
+      plan.tasks.find((t) => t.status === "in_progress") ??
+      plan.tasks.find((t) => t.status === "pending");
+
+    if (!activeTask) {
+      this.workflow.pauseForHumanUpdate = false;
+      await this.persistWorkflow();
+      return false;
+    }
+
+    this.workflow.pauseForHumanUpdate = false;
+    await this.persistWorkflow();
+    await this.runExecutorWithHumanUpdate(activeTask, plan, humanMessage, {
+      skipResumeExecution: true,
+    });
+    return true;
   }
 
   private async runExecutorWithHumanUpdate(
     task: PlanTask,
     plan: ProjectPlan,
     humanMessage: string,
+    options?: { skipResumeExecution?: boolean },
   ): Promise<void> {
     this.workflow.pendingExecutorNotes = this.workflow.pendingExecutorNotes.filter(
       (n) => n !== humanMessage,
@@ -427,8 +644,11 @@ export class Orchestrator {
     });
     if (!checked) return;
 
+    this.workflow.pauseForHumanUpdate = false;
+    await this.persistWorkflow();
+
     const outcome = await this.finishExecutorTaskRun(task, plan, checked);
-    if (outcome === "continue") {
+    if (!options?.skipResumeExecution && outcome === "continue") {
       void this.executeNextTask();
     }
   }
@@ -437,6 +657,8 @@ export class Orchestrator {
     executorOutput: string,
     task: PlanTask,
   ): Promise<void> {
+    if (this.haltRequested || !this.canExecute()) return;
+
     const phaseBefore = this.workflow.phase;
     this.workflow.memoryCaptureActive = true;
     this.emit("agent_status", { memoryCaptureActive: true });
@@ -468,8 +690,12 @@ export class Orchestrator {
     plan: ProjectPlan,
     result: AgentRunResult,
   ): Promise<"continue" | "stopped"> {
+    if (this.haltRequested || result.runId === "halted") {
+      return "stopped";
+    }
+
     await this.persistAgentSessions();
-    this.addMessage("assistant", "executor", result.text);
+    this.addMessage("assistant", "executor", result.text, { channel: "execution" });
     await this.memory.ingestAgentOutput(result.text);
 
     if (result.status === "error") {
@@ -486,17 +712,23 @@ export class Orchestrator {
   }
 
   private async executeNextTask(): Promise<void> {
-    if (
-      this.workflow.humanInterventionActive ||
-      this.executorChainActive ||
-      this.workflow.phase === "rate_limit_pause"
-    ) {
+    if (!this.canExecute() || this.executorChainActive) {
+      return;
+    }
+
+    const plan = this.memory.getState().plan;
+    if (!plan?.accepted) {
       return;
     }
 
     this.executorChainActive = true;
     try {
-      while (!this.workflow.humanInterventionActive) {
+      while (!this.workflow.humanInterventionActive && !this.haltRequested) {
+        if (this.workflow.pauseForHumanUpdate && this.workflow.pendingExecutorNotes.length > 0) {
+          const applied = await this.applyPendingHumanExecutorUpdate();
+          if (applied) continue;
+        }
+
         const pendingRevision = this.workflow.pendingPlanRevisions.shift();
         if (pendingRevision) {
           await this.persistWorkflow();
@@ -512,7 +744,7 @@ export class Orchestrator {
         const nextTask = plan.tasks.find((t) => t.status === "pending");
         if (!nextTask) {
           this.setPhase("completed");
-          this.addMessage("system", "executor", "All tasks completed.");
+          this.addMessage("system", "executor", "All tasks completed.", { channel: "execution" });
           return;
         }
 
@@ -602,7 +834,10 @@ export class Orchestrator {
     fallbackErrorMessage: string,
     metadata?: Record<string, unknown>,
   ): Promise<void> {
-    if (this.workflow.humanInterventionActive) return;
+    if (this.haltRequested || this.workflow.humanInterventionActive) return;
+
+    this.workflow.memoryAgentActive = true;
+    this.emit("agent_status", { memoryAgentActive: true });
 
     const memoryContext = this.memory.buildContextPrompt();
     const prompt = `${memoryContext}\n\n---\n\n${memoryPrompt}\n\nEnd with RESOLUTION_STATUS: resolved or RESOLUTION_STATUS: needs_more_info`;
@@ -621,10 +856,16 @@ export class Orchestrator {
     if (!checked) return;
 
     await this.persistAgentSessions();
-    this.addMessage("assistant", "memory", checked.text, metadata);
+    this.addMessage("assistant", "memory", checked.text, {
+      ...metadata,
+      channel: "reviewer",
+    });
     await this.memory.ingestAgentOutput(checked.text);
 
     if (this.workflow.humanInterventionActive) return;
+
+    this.workflow.memoryAgentActive = false;
+    this.emit("agent_status", { memoryAgentActive: false });
 
     const executorResult = await this.retryWithGuidance(checked.text, taskId);
 
@@ -676,6 +917,7 @@ export class Orchestrator {
       this.addMessage("assistant", "executor", checked.text, {
         retry: true,
         attempt: this.workflow.errorResolutionAttempts,
+        channel: "execution",
       });
       await this.memory.ingestAgentOutput(checked.text);
 
@@ -729,22 +971,28 @@ export class Orchestrator {
       memoryAgentActive: false,
       humanInterventionActive: true,
     });
+    this.workflow.pauseForHumanUpdate = false;
     this.addMessage(
       "system",
       "human",
       reason ??
         "You can now guide the Executor directly. The Memory Agent is deactivated.",
+      { channel: "discourse" },
     );
+    void this.persistWorkflow();
   }
 
   async sendHumanInputInDiscourse(humanMessage: string): Promise<void> {
+    this.haltAgents();
+    return this.runExclusive(async () => {
+    this.resumeAgents();
     if (this.workflow.phase === "rate_limit_pause") {
       await this.retryAfterRateLimit(humanMessage);
       return;
     }
 
     if (this.workflow.humanInterventionActive) {
-      await this.sendHumanGuidance(humanMessage);
+      await this.sendHumanGuidanceInternal(humanMessage);
       return;
     }
 
@@ -754,25 +1002,33 @@ export class Orchestrator {
       );
     }
 
-    this.addMessage("user", "human", humanMessage);
+    this.workflow.pauseForHumanUpdate = true;
+    this.addMessage("user", "human", humanMessage, { channel: "discourse" });
 
     const taskId = this.workflow.currentTaskId;
     if (!taskId) return;
 
     await this.memoryGuideAndRetry(
-      `The human user has intervened in the error resolution discussion between the Memory and Executor agents:\n\n"${humanMessage}"\n\nIncorporate their input and provide updated actionable guidance for the Executor.`,
+      `The human user has intervened in the error resolution discussion between the Memory and Executor agents:\n\n"${humanMessage}"\n\nIncorporate their input and provide updated actionable guidance for the Executor. This human input takes priority over all other changes.`,
       taskId,
       humanMessage,
-      { humanIntervention: true },
+      { humanIntervention: true, channel: "discourse" },
     );
+    this.workflow.pauseForHumanUpdate = false;
+    await this.persistWorkflow();
+    });
   }
 
   async sendHumanGuidance(guidance: string): Promise<void> {
+    return this.runExclusive(() => this.sendHumanGuidanceInternal(guidance));
+  }
+
+  private async sendHumanGuidanceInternal(guidance: string): Promise<void> {
     if (!this.workflow.humanInterventionActive) {
       throw new Error("Human intervention is not active.");
     }
 
-    this.addMessage("user", "human", guidance);
+    this.addMessage("user", "human", guidance, { channel: "discourse" });
 
     const taskId = this.workflow.currentTaskId;
     if (!taskId) return;
@@ -795,7 +1051,7 @@ export class Orchestrator {
     if (!checked) return;
 
     await this.persistAgentSessions();
-    this.addMessage("assistant", "executor", checked.text);
+    this.addMessage("assistant", "executor", checked.text, { channel: "discourse" });
     await this.memory.ingestAgentOutput(checked.text);
 
     if (checked.status === "error") {
@@ -842,11 +1098,13 @@ export class Orchestrator {
     const previousPhase = ctx.previousPhase;
     this.workflow.rateLimitMessage = null;
     this.workflow.rateLimitPausedAgent = null;
+    this.workflow.rateLimitRetryAt = null;
     this.workflow.rateLimitResume = null;
     this.setPhase(previousPhase);
     this.emit("agent_status", {
       rateLimitMessage: null,
       rateLimitPausedAgent: null,
+      rateLimitRetryAt: null,
       rateLimitResume: null,
     });
     await this.persistWorkflow();
@@ -992,9 +1250,92 @@ export class Orchestrator {
     }
   }
 
+  async renameProject(name: string): Promise<void> {
+    await this.memory.rename(name);
+    this.emit("memory_update", this.memory.getState());
+  }
+
+  async stopActiveAgents(): Promise<void> {
+    this.haltAgents();
+    await this.waitForActiveRuns();
+    return this.runExclusive(async () => {
+      this.executorChainActive = false;
+      this.workflow.pauseForHumanUpdate = false;
+
+      const plan = this.memory.getState().plan;
+      if (
+        plan &&
+        (this.workflow.phase === "executing" || this.workflow.phase === "error_resolution")
+      ) {
+        const resetTasks = plan.tasks.map((task) =>
+          task.status === "in_progress" ? { ...task, status: "pending" as const } : task,
+        );
+        await this.memory.setPlan({ ...plan, tasks: resetTasks });
+        this.workflow.currentTaskId = null;
+        this.workflow.memoryAgentActive = false;
+        this.emit("agent_status", { memoryAgentActive: false });
+        this.emit("memory_update", this.memory.getState());
+      }
+
+      this.resumeAgents();
+      await this.persistWorkflow();
+    });
+  }
+
+  async stopProject(): Promise<void> {
+    this.haltAgents();
+    await this.waitForActiveRuns();
+    return this.runExclusive(async () => {
+      this.executorChainActive = false;
+      this.workflow.humanInterventionActive = false;
+      this.workflow.memoryAgentActive = false;
+      this.workflow.memoryCaptureActive = false;
+      this.workflow.currentTaskId = null;
+      this.workflow.pendingExecutorNotes = [];
+      this.workflow.pendingPlanRevisions = [];
+      this.workflow.pauseForHumanUpdate = false;
+      this.workflow.rateLimitMessage = null;
+      this.workflow.rateLimitPausedAgent = null;
+      this.workflow.rateLimitRetryAt = null;
+      this.workflow.rateLimitResume = null;
+
+      const plan = this.memory.getState().plan;
+      if (plan) {
+        const resetTasks = plan.tasks.map((task) =>
+          task.status === "in_progress" ? { ...task, status: "pending" as const } : task,
+        );
+        await this.memory.setPlan({
+          ...plan,
+          accepted: false,
+          readyForAccept: plan.readyForAccept ?? false,
+          tasks: resetTasks,
+        });
+      }
+
+      this.setPhase("planning");
+      this.emit("agent_status", {
+        humanInterventionActive: false,
+        memoryAgentActive: false,
+        memoryCaptureActive: false,
+        rateLimitMessage: null,
+        rateLimitPausedAgent: null,
+        rateLimitRetryAt: null,
+        rateLimitResume: null,
+      });
+      this.emit("memory_update", this.memory.getState());
+      await this.persistWorkflow();
+    });
+  }
+
   async dispose(): Promise<void> {
+    this.haltAgents();
+    await this.waitForActiveRuns();
     await this.persistAgentSessions();
     await this.persistWorkflow();
     await this.agents.dispose();
+  }
+
+  private async waitForActiveRuns(): Promise<void> {
+    await this.operationChain;
   }
 }
